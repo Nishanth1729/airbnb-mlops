@@ -1,8 +1,10 @@
-﻿artifacts/*.pkl
+﻿artifacts/**/*.pkl
 data/*.csv
 __pycache__/
 *.pyc
 venv/
+.venv/
+artifacts/
 mlruns/
 .vscode/
 *.log
