@@ -1,9 +1,8 @@
 import logging
+import numpy as np
 from typing import Any, Dict, Optional
-
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-
 from .predictor import PricePredictor
 
 logging.basicConfig(level=logging.INFO)
@@ -16,7 +15,6 @@ app = FastAPI(
 )
 
 predictor = None
-
 
 @app.on_event("startup")
 async def load_artifacts():
@@ -58,6 +56,14 @@ class PredictionResponse(BaseModel):
     currency: str = "USD"
 
 
+class ConfidencePredictionResponse(BaseModel):
+    predicted_price: float
+    std_deviation: float
+    confidence_level: str
+    abstain: bool
+    currency: str = "USD"
+
+
 @app.get("/")
 async def root():
     return {
@@ -67,6 +73,7 @@ async def root():
         "endpoints": {
             "health": "/health",
             "predict": "/predict (POST)",
+            "predict_with_confidence": "/predict-with-confidence (POST)",
             "features": "/features",
             "docs": "/docs",
         },
@@ -86,7 +93,6 @@ async def health_check():
 async def get_features():
     if predictor is None:
         raise HTTPException(status_code=503, detail="Predictor not loaded")
-
     try:
         feature_info = predictor.get_feature_info()
         return {
@@ -102,7 +108,6 @@ async def get_features():
 async def predict(request: PredictionRequest):
     if predictor is None:
         raise HTTPException(status_code=503, detail="Predictor not loaded")
-
     try:
         prediction = predictor.predict(request.features)
         return PredictionResponse(predicted_price=float(prediction[0]))
@@ -113,6 +118,55 @@ async def predict(request: PredictionRequest):
         )
     except Exception as e:
         logger.error(f"Prediction error: {e}")
+        raise HTTPException(status_code=500, detail=f"Prediction error: {str(e)}")
+
+
+@app.post("/predict-with-confidence", response_model=ConfidencePredictionResponse)
+async def predict_with_confidence(request: PredictionRequest):
+    if predictor is None:
+        raise HTTPException(status_code=503, detail="Predictor not loaded")
+    try:
+        # Get preprocessed features
+        X = predictor.preprocess(request.features)
+
+        # Collect predictions from each tree in the forest
+        model = predictor.model
+        all_preds = np.array([tree.predict(X) for tree in model.estimators_])
+
+        mean_pred = float(np.mean(all_preds))
+        std_pred = float(np.std(all_preds))
+
+        # Confidence thresholds based on std deviation
+        if std_pred < 30:
+            confidence_level = "high"
+        elif std_pred < 80:
+            confidence_level = "medium"
+        else:
+            confidence_level = "low"
+
+        # Abstain if confidence is too low — don't surface unreliable predictions
+        abstain = confidence_level == "low"
+
+        if abstain:
+            logger.warning(
+                f"High uncertainty prediction flagged (std={std_pred:.2f}). "
+                f"Returning abstain=True for features: {request.features}"
+            )
+
+        return ConfidencePredictionResponse(
+            predicted_price=round(mean_pred, 2),
+            std_deviation=round(std_pred, 2),
+            confidence_level=confidence_level,
+            abstain=abstain,
+        )
+
+    except ValueError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Feature validation error: {str(e)}. Use /features endpoint to see required features.",
+        )
+    except Exception as e:
+        logger.error(f"Confidence prediction error: {e}")
         raise HTTPException(status_code=500, detail=f"Prediction error: {str(e)}")
 
 
